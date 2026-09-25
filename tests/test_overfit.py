@@ -267,3 +267,34 @@ def test_ziln_overfits() -> None:
     pos = y > 0
     assert abs(float(ev[pos].mean()) - float(y[pos].mean())) / float(y[pos].mean()) < 0.3
     assert float(ev[~pos].mean()) < 0.1 * float(y[pos].mean())
+
+
+# --------------------------------------------------------------------------- PRM
+
+
+def test_prm_overfits_listwise() -> None:
+    from recsys.losses.listwise_loss import prm_listwise_loss
+    from recsys.models.prm.model import PRM, PRMConfig
+
+    gen = torch.Generator().manual_seed(0)
+    b, k, d = 4, 6, 8
+    cfg = PRMConfig(
+        cand_dim=d, user_dim=d, d_model=16, n_heads=2, n_layers=1, d_ff=32, slate_size=k
+    )
+    feats = torch.randn(b, k, cfg.feature_dim, generator=gen)
+    user = torch.randn(b, d, generator=gen)
+    mask = torch.ones(b, k, dtype=torch.bool)
+    mask[0, 5] = False
+    labels = torch.zeros(b, k)
+    labels[torch.arange(b), torch.tensor([1, 3, 0, 4])] = 1.0
+    fam = torch.randint(0, 5, (b, k), generator=gen)
+    model = PRM(cfg).train()
+
+    def loss_fn() -> torch.Tensor:
+        return prm_listwise_loss(model(feats, user, mask).scores, labels, mask, fam)
+
+    initial, final = run_overfit(list(model.parameters()), loss_fn, threshold=0.10)
+    assert final < 0.10 and final < 0.2 * initial
+    scores = model.eval()(feats, user, mask).scores
+    assert scores[0, 5] == float("-inf")
+    assert scores.argmax(dim=1).tolist() == [1, 3, 0, 4]
