@@ -14,9 +14,25 @@ import pytest
 import torch
 
 from recsys import seed_everything
+from recsys.data.collator import SequenceCollator
+from recsys.data.impression_collator import ImpressionBatch, ImpressionCollator
+from recsys.data.schema import (
+    PRODUCT_FEATURE_DIM,
+    USER_FEATURE_DIM,
+    ActionType,
+    DelayConfig,
+    ImpressionSlate,
+    InteractionEvent,
+    InteractionRecord,
+)
+from recsys.layers.hstu import HSTUConfig
 from recsys.layers.prefix_trie import SemanticIdTrie
 from recsys.layers.rq_vae import RQVAE, RQVAEConfig
+from recsys.losses.funnel_loss import UnifiedFunnelLoss
+from recsys.losses.ziln_loss import ZILNHead, ziln_expected_value, ziln_loss
 from recsys.metrics.ranking_metrics import recall_at_k
+from recsys.models.ple.model import PLEConfig
+from recsys.models.ranker import HSTUPLERanker
 from recsys.models.tiger.model import TIGER, SemanticIdTokenizer, TIGERConfig
 
 MAX_STEPS = 300
@@ -131,3 +147,123 @@ def test_tiger_overfits_and_reaches_full_recall_on_memorized_examples() -> None:
     r = recall_at_k(wide.item_ids.numpy(), targets.numpy()[:, None], np.ones((4, 1), bool), 100)
     assert r.mean == 1.0 and r.num_users == 4
     assert wide.item_ids.shape == (4, 100) and (wide.item_ids[:, n:] == -1).all()
+
+
+# ------------------------------------------------------------------- HSTU + PLE
+
+
+def _ev(item: int, action: ActionType, ts: float) -> InteractionEvent:
+    return InteractionEvent(item_id=item, action=action, timestamp=ts)
+
+
+def funnel_batch(num_items: int = 30) -> ImpressionBatch:
+    """3 slates x 4 candidates with a monotone funnel, one resolved approval, one pending."""
+    records = [
+        InteractionRecord(
+            user_index=u,
+            history=tuple(
+                _ev(1 + (u * 3 + i) % num_items, ActionType.VIEW, float(i)) for i in range(4)
+            ),
+            target=_ev(2 + u, ActionType.VIEW, 5.0),
+        )
+        for u in range(3)
+    ]
+    slates = [
+        ImpressionSlate(
+            user_index=0, slate_id=0, candidate_item_ids=(1, 2, 3, 4),
+            y_click=(1, 1, 0, 0), y_apply=(1, 0, 0, 0), y_approve=(1, 0, 0, 0),
+            p_click=(0.5,) * 4, p_apply=(0.5,) * 4, p_approve=(0.5,) * 4,
+            payouts=(100.0,) * 4, amounts=(8000.0, 0.0, 0.0, 0.0), eligible=(True,) * 4,
+            served_at_days=300.0, decision_delay_days=(1.0, 0.0, 0.0, 0.0),
+        ),
+        ImpressionSlate(
+            user_index=1, slate_id=1, candidate_item_ids=(5, 6, 7, 8),
+            y_click=(0, 1, 0, 1), y_apply=(0, 1, 0, 0), y_approve=(0, 1, 0, 0),
+            p_click=(0.5,) * 4, p_apply=(0.5,) * 4, p_approve=(0.5,) * 4,
+            payouts=(100.0,) * 4, amounts=(0.0, 12000.0, 0.0, 0.0), eligible=(True,) * 4,
+            served_at_days=360.0, decision_delay_days=(0.0, 30.0, 0.0, 0.0),  # pending
+        ),
+        ImpressionSlate(
+            user_index=2, slate_id=2, candidate_item_ids=(9, 10, 11, 12),
+            y_click=(1, 0, 0, 0), y_apply=(1, 0, 0, 0), y_approve=(0, 0, 0, 0),
+            p_click=(0.5,) * 4, p_apply=(0.5,) * 4, p_approve=(0.5,) * 4,
+            payouts=(100.0,) * 4, amounts=(0.0,) * 4, eligible=(True,) * 4,
+            served_at_days=350.0, decision_delay_days=(2.0, 0.0, 0.0, 0.0),
+        ),
+    ]  # fmt: skip
+    gen = torch.Generator().manual_seed(0)
+    catalog = torch.rand(num_items + 1, PRODUCT_FEATURE_DIM, generator=gen).numpy()
+    catalog[0] = 0
+    users = torch.rand(3, USER_FEATURE_DIM, generator=gen).numpy()
+    family = np.array([-1] + [i % 5 for i in range(num_items)], dtype=np.int64)
+    coll = ImpressionCollator(
+        catalog, users, family, snapshot_at_days=365.0, delay_config=DelayConfig()
+    )
+    batch = coll(slates)
+    return batch.with_sequence(SequenceCollator(max_len=6)(records))
+
+
+def test_hstu_ple_ranker_overfits_unified_funnel_loss() -> None:
+    batch = funnel_batch()
+    assert batch.status[1, 1].item() == 1 and not batch.approve_observed[1, 1]
+    hstu = HSTUConfig(
+        num_items=30, d_model=16, n_heads=2, n_layers=1, max_len=6, max_candidates=4,
+        num_time_buckets=8,
+    )  # fmt: skip
+    ple = PLEConfig(input_dim=hstu.fusion_dim, expert_hidden=(16,), expert_dim=8, tower_hidden=(8,))
+    model = HSTUPLERanker(hstu, ple, downsample_rate=0.25).train()
+    model.fit_tabular_stats(batch.tabular, batch.candidate_mask)
+    loss = UnifiedFunnelLoss()
+
+    def loss_fn() -> torch.Tensor:
+        out = model(batch)
+        terms = loss(
+            out.z1, out.z2, out.z3, batch.y_click, batch.y_apply, batch.y_approve,
+            batch.approve_weight, batch.approve_observed, batch.candidate_mask,
+            amount_logits=out.amount_logits, amounts=batch.amounts,
+        )  # fmt: skip
+        total: torch.Tensor = terms.total
+        return total
+
+    # the ZILN NLL has a data-dependent floor (log y), so threshold the probability terms
+    run_overfit(list(model.parameters()), loss_fn, threshold=0.3, lr=1e-2, max_steps=400)
+    model.eval()
+    out = model(batch)
+    terms = loss(
+        out.z1, out.z2, out.z3, batch.y_click, batch.y_apply, batch.y_approve,
+        batch.approve_weight, batch.approve_observed, batch.candidate_mask,
+        amount_logits=out.amount_logits, amounts=batch.amounts,
+    )  # fmt: skip
+    prob_terms = terms.click + terms.apply + terms.approve + terms.ctcvr + terms.ctcavr
+    assert float(prob_terms) < 0.15
+    assert terms.num_resolved_applications == 2 and terms.num_amount_rows == 1
+    assert out.amount_logits is not None
+    ev = ziln_expected_value(out.amount_logits)
+    assert abs(float(ev[0, 0]) - 8000.0) / 8000.0 < 0.5  # approved row's amount recovered
+    # predict() adds log r to the click logit only
+    pred = model.predict(batch)
+    assert torch.allclose(pred.z1, out.z1 + np.log(0.25)) and torch.allclose(pred.z2, out.z2)
+
+
+# -------------------------------------------------------------------------- ZILN
+
+
+def test_ziln_overfits() -> None:
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(32, 6, generator=gen)
+    # positive iff x[:, 1] > 0 (separable); amount log-linear in x[:, 0]
+    y = torch.where(x[:, 1] > 0, torch.exp(8.0 + 0.3 * x[:, 0]), torch.zeros(32))
+    head = ZILNHead(6, mu_bias_init=8.0).train()
+
+    def loss_fn() -> torch.Tensor:
+        out: torch.Tensor = ziln_loss(head(x), y).total
+        return out
+
+    # the NLL has a data-dependent floor (log y), so the early-exit threshold never fires
+    run_overfit(list(head.parameters()), loss_fn, threshold=0.0, lr=2e-2, max_steps=1000)
+    full = ziln_loss(head(x), y)
+    assert float(full.bce.detach()) < 0.1
+    ev = ziln_expected_value(head(x))
+    pos = y > 0
+    assert abs(float(ev[pos].mean()) - float(y[pos].mean())) / float(y[pos].mean()) < 0.3
+    assert float(ev[~pos].mean()) < 0.1 * float(y[pos].mean())
