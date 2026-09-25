@@ -48,15 +48,52 @@ class ActionType(IntEnum):
     CREDIT_PULL = 3
     APPLY_APPROVED = 4
     APPLY_DECLINED = 5
+    APPLY_PENDING = 6  # applied, decision not yet observed at ``snapshot_at_days``
 
 
 NUM_ACTIONS: int = len(ActionType)
 
 #: Actions that count as positive engagement with a product (used as retrieval
-#: targets and PinnerFormer "future window" positives).
+#: targets and "future window" positives).  TRAINING-label semantics only: "this
+#: history event is evidence of intent", exactly as ``APPLY_APPROVED`` already is.
+#: Serving eligibility is a separate rule: ``pending_product_ids`` and
+#: ``held_product_ids`` are always masked, so a product the user has applied for is
+#: never re-served while the application is open.
 POSITIVE_ACTIONS: frozenset[ActionType] = frozenset(
-    {ActionType.VIEW, ActionType.CREDIT_PULL, ActionType.APPLY_APPROVED}
+    {ActionType.VIEW, ActionType.CREDIT_PULL, ActionType.APPLY_APPROVED, ActionType.APPLY_PENDING}
 )
+#: Every action that represents an application, whatever its (observed) outcome.
+APPLY_ACTIONS: frozenset[ActionType] = frozenset(
+    {ActionType.APPLY_APPROVED, ActionType.APPLY_DECLINED, ActionType.APPLY_PENDING}
+)
+
+
+class ApplicationStatus(IntEnum):
+    """Observed status of a slate candidate at a training cut-off (``snapshot_at_days``)."""
+
+    NOT_APPLIED = 0
+    PENDING = 1
+    APPROVED = 2
+    DECLINED = 3
+
+
+def observed_status(
+    y_apply: int,
+    y_approve: int,
+    served_at_days: float,
+    decision_delay_days: float,
+    snapshot_at_days: float,
+) -> ApplicationStatus:
+    """Scalar "store causes, derive views" rule; vectorized twin in ``delayed_feedback``.
+
+    The slate stores the *oracle* outcome and the decision delay; the status observed
+    at any cut-off is a pure function of those plus the snapshot.
+    """
+    if y_apply == 0:
+        return ApplicationStatus.NOT_APPLIED
+    if served_at_days + decision_delay_days > snapshot_at_days:
+        return ApplicationStatus.PENDING
+    return ApplicationStatus.APPROVED if y_approve == 1 else ApplicationStatus.DECLINED
 
 
 class ProductFamily(str, Enum):
@@ -109,10 +146,67 @@ STATE_INDEX: dict[str, int] = {s: i for i, s in enumerate(US_STATES)}
 NUM_STATES: int = len(US_STATES)
 
 #: Feature-vector widths (kept as constants so collators can preallocate).
-PRODUCT_FEATURE_DIM: int = 8 + NUM_FAMILIES
-USER_FEATURE_DIM: int = 4 + NUM_TIERS
+#: Product: 8 base economics + family one-hot + 5 extended economics (§4.1).
+PRODUCT_FEATURE_DIM: int = 8 + NUM_FAMILIES + 5
+#: User: 4 base + 12 financial state + tier one-hot + pending-family multi-hot.
+USER_FEATURE_DIM: int = 4 + 12 + NUM_TIERS + NUM_FAMILIES
 
 _FROZEN = ConfigDict(frozen=True, extra="forbid")
+
+
+# --------------------------------------------------------------------------- #
+# Decision-delay law (delayed feedback)
+# --------------------------------------------------------------------------- #
+
+_LN = math.log
+
+
+@dataclass(frozen=True)
+class DelayConfig:
+    """Per ``(family, outcome)`` law for the partner's decision delay in days.
+
+    Each entry is indexed ``[family_index][outcome]`` with ``outcome = 0`` for approved
+    and ``1`` for declined.  The delay is a mixture: with probability ``p_instant`` the
+    decision is instant (``instant_delay_days``), otherwise ``log-normal(log_mu, log_sigma)``.
+
+    Defaults: cards ~80 % instant, remainder < 2 d; personal loan 1-3 d; auto refinance
+    3-7 d; mortgage log-normal ~35 d approved / ~20 d declined.
+    """
+
+    p_instant: tuple[tuple[float, float], ...] = (
+        (0.8, 0.8),  # CREDIT_CARD
+        (0.8, 0.8),  # BALANCE_TRANSFER_CARD
+        (0.0, 0.0),  # PERSONAL_LOAN
+        (0.0, 0.0),  # AUTO_REFINANCE
+        (0.0, 0.0),  # MORTGAGE
+    )
+    log_mu: tuple[tuple[float, float], ...] = (
+        (_LN(0.7), _LN(0.7)),
+        (_LN(0.7), _LN(0.7)),
+        (_LN(2.0), _LN(2.0)),
+        (_LN(5.0), _LN(5.0)),
+        (_LN(35.0), _LN(20.0)),
+    )
+    log_sigma: tuple[tuple[float, float], ...] = (
+        (0.5, 0.5),
+        (0.5, 0.5),
+        (0.3, 0.3),
+        (0.3, 0.3),
+        (0.4, 0.4),
+    )
+    instant_delay_days: float = 0.01
+
+    def __post_init__(self) -> None:
+        for name in ("p_instant", "log_mu", "log_sigma"):
+            table = getattr(self, name)
+            if len(table) != NUM_FAMILIES or any(len(row) != 2 for row in table):
+                raise ValueError(f"{name} must be shaped (NUM_FAMILIES, 2)")
+        if any(not 0.0 <= p <= 1.0 for row in self.p_instant for p in row):
+            raise ValueError("p_instant entries must be in [0, 1]")
+        if any(s <= 0.0 for row in self.log_sigma for s in row):
+            raise ValueError("log_sigma entries must be > 0")
+        if self.instant_delay_days <= 0.0:
+            raise ValueError("instant_delay_days must be > 0 (decision_delay_days > 0 iff applied)")
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +237,12 @@ class FinancialProduct(BaseModel):
     reward_rate: float = Field(ge=0.0, le=1.0)
     term_months: int = Field(ge=0)
     partner_payout: float = Field(gt=0.0, description="Revenue R_i on a funded approval")
+    # --- extended economics (all defaulted; reference catalogs still validate) -----
+    intro_apr_months: int = Field(default=0, ge=0, description="BT cards: 0 % intro window")
+    balance_transfer_fee_rate: float = Field(default=0.0, ge=0.0, le=0.1)
+    origination_fee_rate: float = Field(default=0.0, ge=0.0, le=0.1, description="loans, refi")
+    signup_bonus_value: float = Field(default=0.0, ge=0.0, description="cards, $")
+    closing_costs: float = Field(default=0.0, ge=0.0, description="mortgage, $")
 
     @model_validator(mode="after")
     def _validate_states(self) -> FinancialProduct:
@@ -170,6 +270,12 @@ class FinancialProduct(BaseModel):
         vec[6] = self.term_months / 360.0
         vec[7] = math.log1p(self.partner_payout) / 8.0
         vec[8 + self.family_index] = 1.0
+        base = 8 + NUM_FAMILIES
+        vec[base + 0] = self.intro_apr_months / 24.0
+        vec[base + 1] = self.balance_transfer_fee_rate / 0.1
+        vec[base + 2] = self.origination_fee_rate / 0.1
+        vec[base + 3] = math.log1p(self.signup_bonus_value) / 7.0
+        vec[base + 4] = math.log1p(self.closing_costs) / 9.0
         return vec
 
 
@@ -187,6 +293,23 @@ class UserProfile(BaseModel):
     annual_income: float = Field(ge=0.0)
     state: str
     held_product_ids: tuple[int, ...] = ()
+    # --- financial state (all defaulted; drives net user benefit, §4.1 / D5) ---------
+    revolving_balance: float = Field(default=0.0, ge=0.0)
+    revolving_apr: float = Field(default=0.0, ge=0.0, le=1.0)
+    annual_card_spend: float = Field(default=0.0, ge=0.0)
+    other_debt_balance: float = Field(default=0.0, ge=0.0)
+    other_debt_apr: float = Field(default=0.0, ge=0.0, le=1.0)
+    other_debt_remaining_months: int = Field(default=0, ge=0)
+    auto_loan_balance: float = Field(default=0.0, ge=0.0)
+    auto_loan_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    auto_remaining_months: int = Field(default=0, ge=0)
+    mortgage_balance: float = Field(default=0.0, ge=0.0)
+    mortgage_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    mortgage_remaining_months: int = Field(default=0, ge=0)
+    recent_hard_pulls_30d: int = Field(default=0, ge=0)
+    # --- pending context (derived from APPLY_PENDING events; masked like held) -------
+    pending_product_ids: tuple[int, ...] = ()
+    pending_family_ids: tuple[int, ...] = ()
 
     @model_validator(mode="after")
     def _validate(self) -> UserProfile:
@@ -194,6 +317,10 @@ class UserProfile(BaseModel):
             raise ValueError(f"unknown state code: {self.state}")
         if any(pid < 1 for pid in self.held_product_ids):
             raise ValueError("held_product_ids must be >= 1")
+        if any(pid < 1 for pid in self.pending_product_ids):
+            raise ValueError("pending_product_ids must be >= 1")
+        if any(not 0 <= f < NUM_FAMILIES for f in self.pending_family_ids):
+            raise ValueError(f"pending_family_ids must be in [0, {NUM_FAMILIES})")
         return self
 
     @property
@@ -214,7 +341,23 @@ class UserProfile(BaseModel):
         vec[1] = self.dti
         vec[2] = math.log1p(self.annual_income) / 13.0
         vec[3] = min(len(self.held_product_ids), 5) / 5.0
-        vec[4 + self.tier_index] = 1.0
+        # financial state: 4 log balances, 4 rates, 3 remaining-month terms, hard pulls
+        vec[4] = math.log1p(self.revolving_balance) / 13.0
+        vec[5] = math.log1p(self.other_debt_balance) / 13.0
+        vec[6] = math.log1p(self.auto_loan_balance) / 13.0
+        vec[7] = math.log1p(self.mortgage_balance) / 13.0
+        vec[8] = self.revolving_apr
+        vec[9] = self.other_debt_apr
+        vec[10] = self.auto_loan_rate
+        vec[11] = self.mortgage_rate
+        vec[12] = self.other_debt_remaining_months / 360.0
+        vec[13] = self.auto_remaining_months / 360.0
+        vec[14] = self.mortgage_remaining_months / 360.0
+        vec[15] = min(self.recent_hard_pulls_30d, 5) / 5.0
+        vec[16 + self.tier_index] = 1.0
+        base = 16 + NUM_TIERS
+        for f in self.pending_family_ids:
+            vec[base + f] = 1.0
         return vec
 
 
@@ -281,6 +424,11 @@ class ImpressionSlate(BaseModel):
     Funnel semantics: ``y_apply`` is only observable when ``y_click == 1`` and
     ``y_approve`` only when ``y_apply == 1``.  ``p_apply`` and ``p_approve`` are
     the *conditional* probabilities p(apply | click) and p(approve | apply).
+
+    Labels are the **eventual (oracle)** outcomes.  ``served_at_days`` and
+    ``decision_delay_days`` let :func:`observed_status` derive what is *observed*
+    at any training cut-off: an application whose decision arrives after the
+    snapshot is ``PENDING`` and its ``y_approve`` must not be used as a label.
     """
 
     model_config = _FROZEN
@@ -297,6 +445,8 @@ class ImpressionSlate(BaseModel):
     payouts: tuple[float, ...]
     amounts: tuple[float, ...]
     eligible: tuple[bool, ...]
+    served_at_days: float = Field(ge=0.0)
+    decision_delay_days: tuple[float, ...]  # > 0 iff y_apply == 1, else 0.0
 
     @property
     def size(self) -> int:
@@ -308,6 +458,7 @@ class ImpressionSlate(BaseModel):
         fields = (
             self.y_click, self.y_apply, self.y_approve, self.p_click, self.p_apply,
             self.p_approve, self.payouts, self.amounts, self.eligible,
+            self.decision_delay_days,
         )  # fmt: skip
         if any(len(f) != k for f in fields):
             raise ValueError("all per-candidate fields must have the same length")
@@ -326,6 +477,10 @@ class ImpressionSlate(BaseModel):
                 raise ValueError("amount must be > 0 if and only if the application was approved")
             if not self.eligible[i] and self.p_approve[i] != 0.0:
                 raise ValueError("ineligible candidates must have p_approve == 0")
+            if (self.decision_delay_days[i] > 0.0) != (ya == 1):
+                raise ValueError("decision_delay_days must be > 0 if and only if y_apply == 1")
+            if self.decision_delay_days[i] < 0.0:
+                raise ValueError("decision_delay_days must be >= 0")
         return self
 
 
@@ -345,6 +500,7 @@ class SyntheticDataset:
     catalog_features: npt.NDArray[np.float32]  # (N+1, PRODUCT_FEATURE_DIM), row 0 zero
     user_features: npt.NDArray[np.float32]  # (U, USER_FEATURE_DIM)
     item_counts: npt.NDArray[np.int64]  # (N+1,) history frequency for logQ
+    snapshot_at_days: float  # global training cut-off T_snap (observed-label semantics)
     catalog_mean: npt.NDArray[np.float32] = field(default_factory=lambda: np.zeros(0, np.float32))
     catalog_std: npt.NDArray[np.float32] = field(default_factory=lambda: np.ones(0, np.float32))
 

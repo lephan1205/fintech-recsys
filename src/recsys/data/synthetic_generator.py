@@ -14,6 +14,12 @@ Design goals
   adverse ``APPLY_DECLINED`` signals.
 * **Determinism.** Everything is drawn from a single ``numpy`` generator in a
   fixed order; the same seed yields byte-identical serialized output.
+* **Delayed feedback (format v2).** Every application draws a decision delay from
+  :class:`DelayConfig`; the oracle outcome is still drawn from
+  :func:`approve_probability` — only its *observability* at ``snapshot_at_days``
+  changes.  History events whose decision arrives after the snapshot are emitted as
+  ``APPLY_PENDING``; slates store ``served_at_days`` and ``decision_delay_days`` so
+  the observed status can be derived at any cut-off.
 """
 
 from __future__ import annotations
@@ -28,7 +34,9 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
+from recsys.data.delayed_feedback import observed_status, sample_decision_delay
 from recsys.data.schema import (
+    APPLY_ACTIONS,
     FAMILY_ORDER,
     NUM_FAMILIES,
     NUM_STATES,
@@ -41,6 +49,8 @@ from recsys.data.schema import (
     US_STATES,
     USER_FEATURE_DIM,
     ActionType,
+    ApplicationStatus,
+    DelayConfig,
     FinancialProduct,
     ImpressionSlate,
     InteractionEvent,
@@ -50,7 +60,10 @@ from recsys.data.schema import (
     UserProfile,
 )
 
-FORMAT_VERSION = 1
+#: v2 adds ``snapshot_at_days`` (dataset + meta), ``served_at_days`` and
+#: ``decision_delay_days`` (slates), ``APPLY_PENDING`` (histories) and the extended
+#: product / user economics.  v1 directories are rejected by :func:`load_dataset`.
+FORMAT_VERSION = 2
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -75,19 +88,39 @@ class GeneratorConfig:
     ineligible_per_slate: int = 2
     future_window_days: tuple[float, float] = (14.0, 28.0)
     max_future: int = 16
+    # --- delayed feedback / observability (format v2) ------------------------------
+    #: Global training cut-off T_snap; defaults to ``horizon_days``.
+    snapshot_at_days: float = 365.0
+    delay: DelayConfig = DelayConfig()
+    #: Each user's timeline is shifted so its last event lands in
+    #: ``[snapshot - recency_window_days, snapshot]``: histories end near the snapshot,
+    #: so applications with slow decisions are genuinely pending at the cut-off.
+    recency_window_days: float = 30.0
+    #: Slates are served in ``[snapshot - served_window_days, snapshot]``.
+    served_window_days: float = 90.0
+    #: Catalog family mix (index-aligned with ``FAMILY_ORDER``); overridable so an
+    #: ablation can build a mortgage-heavy catalog.
+    family_mix: tuple[float, ...] = (0.40, 0.15, 0.20, 0.10, 0.15)
 
     def __post_init__(self) -> None:
         if self.min_history < 2 or self.max_history < self.min_history:
             raise ValueError("need 2 <= min_history <= max_history")
         if self.ineligible_per_slate >= self.slate_size:
             raise ValueError("ineligible_per_slate must be < slate_size")
+        if self.snapshot_at_days <= 0.0:
+            raise ValueError("snapshot_at_days must be > 0")
+        if not 0.0 <= self.recency_window_days <= self.snapshot_at_days:
+            raise ValueError("recency_window_days must be in [0, snapshot_at_days]")
+        if not 0.0 < self.served_window_days <= self.snapshot_at_days:
+            raise ValueError("served_window_days must be in (0, snapshot_at_days]")
+        if len(self.family_mix) != NUM_FAMILIES or abs(sum(self.family_mix) - 1.0) > 1e-6:
+            raise ValueError("family_mix must have NUM_FAMILIES entries summing to 1")
 
 
 # --------------------------------------------------------------------------- #
 # Family-level parameters (index-aligned with FAMILY_ORDER)
 # --------------------------------------------------------------------------- #
 
-_FAMILY_MIX = np.array([0.40, 0.15, 0.20, 0.10, 0.15])
 _TIER_MIX_BY_FAMILY = np.array(
     [
         [0.15, 0.20, 0.25, 0.25, 0.15],  # CREDIT_CARD (secured cards reach deep subprime)
@@ -110,6 +143,12 @@ _FAMILY_TERMS: tuple[tuple[int, ...], ...] = (
 _CARD_FEES = np.array([0.0, 95.0, 250.0, 550.0])
 _CARD_FEE_P = np.array([0.60, 0.25, 0.10, 0.05])
 _IS_CARD = (True, True, False, False, False)
+# Extended economics (§4.2): BT intro windows, signup bonuses, origination, closing costs.
+_BT_INTRO_MONTHS = np.array([12, 15, 18, 21])
+_SIGNUP_BONUS = np.array([0.0, 150.0, 200.0, 750.0])
+_SIGNUP_BONUS_P = np.array([0.50, 0.25, 0.15, 0.10])
+_OTHER_DEBT_TERMS = np.array([12, 24, 36, 48, 60])
+_BT, _PL, _AUTO, _MORT = 1, 2, 3, 4
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +253,7 @@ class SyntheticFintechDataGenerator:
     def generate_products(self) -> list[FinancialProduct]:
         cfg, rng = self.config, self.rng
         products: list[FinancialProduct] = []
-        fam_idx = rng.choice(NUM_FAMILIES, size=cfg.num_products, p=_FAMILY_MIX)
+        fam_idx = rng.choice(NUM_FAMILIES, size=cfg.num_products, p=np.array(cfg.family_mix))
         for item_id, f in enumerate(fam_idx.tolist(), start=1):
             tier = int(rng.choice(NUM_TIERS, p=_TIER_MIX_BY_FAMILY[f]))
             min_fico = TIER_FICO_FLOORS[tier] + int(rng.integers(0, _TIER_FICO_JITTER[tier]))
@@ -232,6 +271,17 @@ class SyntheticFintechDataGenerator:
             reward = float(np.round(rng.uniform(0.01, 0.05), 4)) if _IS_CARD[f] else 0.0
             term = int(rng.choice(_FAMILY_TERMS[f]))
             payout = float(np.round(np.exp(_FAMILY_LOG_PAYOUT_MU[f] + 0.3 * rng.normal()), 2))
+            # extended economics, drawn after the inherited fields (RNG order preserved)
+            intro_months = int(rng.choice(_BT_INTRO_MONTHS)) if f == _BT else 0
+            bt_fee = float(np.round(rng.uniform(0.03, 0.05), 4)) if f == _BT else 0.0
+            bonus = float(rng.choice(_SIGNUP_BONUS, p=_SIGNUP_BONUS_P)) if _IS_CARD[f] else 0.0
+            if f in (_PL, _AUTO):
+                orig_fee = float(np.round(rng.uniform(0.0, 0.08), 4))
+            elif f == _MORT:
+                orig_fee = float(np.round(rng.uniform(0.0, 0.01), 4))
+            else:
+                orig_fee = 0.0
+            closing = float(np.round(rng.uniform(2_000.0, 8_000.0), 0)) if f == _MORT else 0.0
             family = FAMILY_ORDER[f]
             products.append(
                 FinancialProduct(
@@ -247,6 +297,11 @@ class SyntheticFintechDataGenerator:
                     reward_rate=reward,
                     term_months=term,
                     partner_payout=payout,
+                    intro_apr_months=intro_months,
+                    balance_transfer_fee_rate=bt_fee,
+                    origination_fee_rate=orig_fee,
+                    signup_bonus_value=bonus,
+                    closing_costs=closing,
                 )
             )
         return products
@@ -268,6 +323,7 @@ class SyntheticFintechDataGenerator:
             if n_held > 0 and elig.size > 0:
                 picks = rng.choice(elig, size=min(n_held, elig.size), replace=False)
                 held = tuple(sorted(int(i) for i in picks))
+            fin = self._draw_financial_state(fico, dti, income)
             users.append(
                 UserProfile(
                     user_index=u,
@@ -276,9 +332,54 @@ class SyntheticFintechDataGenerator:
                     annual_income=income,
                     state=state,
                     held_product_ids=held,
+                    **fin,
                 )
             )
         return users
+
+    def _draw_financial_state(self, fico: int, dti: float, income: float) -> dict[str, Any]:
+        """Financial state correlated with FICO / DTI / income (§4.2)."""
+        rng = self.rng
+        log_income = math.log(income)
+
+        def rate(
+            base: float, slope: float, anchor: int, noise: float, lo: float, hi: float
+        ) -> float:
+            return float(np.clip(base - slope * (fico - anchor) + rng.normal(0.0, noise), lo, hi))
+
+        revolving = float(np.round(dti * income * rng.uniform(0.2, 0.6), 0))
+        revolving_apr = rate(0.32, 0.0004, 600, 0.03, 0.10, 0.36)
+        card_spend = float(np.round(income * rng.uniform(0.10, 0.35), 0))
+        other_balance, other_apr, other_months = 0.0, 0.0, 0
+        if rng.random() < 0.5:
+            other_balance = float(np.round(dti * income * rng.uniform(0.3, 1.0), 0))
+            other_apr = rate(0.20, 0.0003, 600, 0.03, 0.06, 0.30)
+            other_months = int(rng.choice(_OTHER_DEBT_TERMS))
+        auto_balance, auto_rate, auto_months = 0.0, 0.0, 0
+        if rng.random() < 0.45:
+            auto_balance = float(np.round(np.clip(np.exp(rng.normal(9.8, 0.4)), 3e3, 6e4), 0))
+            auto_rate = rate(0.12, 0.0004, 650, 0.02, 0.03, 0.20)
+            auto_months = int(rng.integers(6, 73))
+        mort_balance, mort_rate, mort_months = 0.0, 0.0, 0
+        p_mortgage = 1.0 / (1.0 + math.exp(-0.8 * (log_income - 11.0)))
+        if rng.random() < p_mortgage:
+            mort_balance = float(np.round(np.clip(np.exp(rng.normal(12.4, 0.35)), 5e4, 9e5), 0))
+            mort_rate = rate(0.07, 0.0002, 700, 0.01, 0.03, 0.10)
+            mort_months = int(rng.integers(60, 361))
+        return {
+            "revolving_balance": revolving,
+            "revolving_apr": round(revolving_apr, 4),
+            "annual_card_spend": card_spend,
+            "other_debt_balance": other_balance,
+            "other_debt_apr": round(other_apr, 4),
+            "other_debt_remaining_months": other_months,
+            "auto_loan_balance": auto_balance,
+            "auto_loan_rate": round(auto_rate, 4),
+            "auto_remaining_months": auto_months,
+            "mortgage_balance": mort_balance,
+            "mortgage_rate": round(mort_rate, 4),
+            "mortgage_remaining_months": mort_months,
+        }
 
     # ------------------------------------------------------------------ histories
     def _sample_item(
@@ -298,14 +399,17 @@ class SyntheticFintechDataGenerator:
         users: list[UserProfile],
         products: list[FinancialProduct],
         gates: _GateArrays,
-    ) -> tuple[list[InteractionRecord], list[npt.NDArray[np.float64]]]:
-        """Returns records and, per user, the family-affinity vector (reused for slates)."""
+    ) -> tuple[list[InteractionRecord], list[npt.NDArray[np.float64]], list[dict[str, Any]]]:
+        """Returns records, per-user family affinities (reused for slates) and, per user,
+        the pending / hard-pull profile updates derived from the generated events."""
         cfg, rng = self.config, self.rng
         all_by_family = [np.flatnonzero(gates.family == f) for f in range(NUM_FAMILIES)]
         by_id = {p.item_id: p for p in products}
         records: list[InteractionRecord] = []
         affinities: list[npt.NDArray[np.float64]] = []
+        updates: list[dict[str, Any]] = []
         self.fico_at_event = []
+        snapshot = cfg.snapshot_at_days
 
         for user in users:
             affinity = rng.dirichlet(np.ones(NUM_FAMILIES))
@@ -320,6 +424,11 @@ class SyntheticFintechDataGenerator:
             gaps[0] = 0.0
             timestamps = np.round(np.cumsum(gaps), 3)
             cut = max(1, n - int(rng.integers(2, 6)))
+            # Anchor the timeline so the last event lands shortly before the snapshot
+            # (never shifting the first event below day 0).
+            end = snapshot - rng.uniform(0.0, cfg.recency_window_days)
+            offset = max(end - float(timestamps[-1]), -float(timestamps[0]))
+            timestamps = np.round(timestamps + offset, 3)
 
             is_score_change = rng.random(n) < cfg.score_change_prob
             is_score_change[cut] = False  # the target must be a product event
@@ -330,7 +439,12 @@ class SyntheticFintechDataGenerator:
             self.fico_at_event.append(fico_path)
 
             action_roll = rng.random(n)
-            families = rng.choice(NUM_FAMILIES, size=n, p=affinity)
+            # Only families that exist in the catalog can be browsed (a custom family_mix
+            # may leave some empty); renormalize the affinity over the available ones.
+            avail = np.array([pool.size > 0 for pool in all_by_family], dtype=np.float64)
+            p_family = affinity * avail
+            p_family = p_family / p_family.sum()
+            families = rng.choice(NUM_FAMILIES, size=n, p=p_family)
             events: list[InteractionEvent] = []
             for t in range(n):
                 ts = float(timestamps[t])
@@ -349,9 +463,17 @@ class SyntheticFintechDataGenerator:
                     p = approve_probability(
                         int(fico_path[t]), user.dti, user.annual_income, user.state, by_id[item]
                     )
-                    action = (
-                        ActionType.APPLY_APPROVED if rng.random() < p else ActionType.APPLY_DECLINED
+                    approved = rng.random() < p
+                    # The oracle decision is drawn above; only its observability changes.
+                    delay = float(
+                        sample_decision_delay(rng, families[t], 0 if approved else 1, cfg.delay)
                     )
+                    if ts + delay > snapshot:
+                        action = ActionType.APPLY_PENDING
+                    else:
+                        action = (
+                            ActionType.APPLY_APPROVED if approved else ActionType.APPLY_DECLINED
+                        )
                 elif r < cfg.apply_prob + cfg.credit_pull_prob:
                     action = ActionType.CREDIT_PULL
                 else:
@@ -373,7 +495,29 @@ class SyntheticFintechDataGenerator:
                     future_window=future,
                 )
             )
-        return records, affinities
+            # Pending context = state at the snapshot, over *all* generated events.
+            pending_items = sorted(
+                {
+                    e.item_id
+                    for e in events
+                    if e.action == ActionType.APPLY_PENDING and e.timestamp <= snapshot
+                }
+            )
+            pending_fams = sorted({int(gates.family[i]) for i in pending_items})
+            recent_applies = sum(
+                1
+                for e in events
+                if e.action in APPLY_ACTIONS and snapshot - 30.0 < e.timestamp <= snapshot
+            )
+            hard_pulls = int(rng.poisson(0.3)) + recent_applies
+            updates.append(
+                {
+                    "pending_product_ids": tuple(pending_items),
+                    "pending_family_ids": tuple(pending_fams),
+                    "recent_hard_pulls_30d": hard_pulls,
+                }
+            )
+        return records, affinities, updates
 
     # --------------------------------------------------------------------- slates
     def generate_slates(
@@ -385,6 +529,7 @@ class SyntheticFintechDataGenerator:
         cfg, rng = self.config, self.rng
         slates: list[ImpressionSlate] = []
         slate_id = 0
+        snapshot = cfg.snapshot_at_days
         n_elig_target = cfg.slate_size - cfg.ineligible_per_slate
         for user, affinity in zip(users, affinities, strict=True):
             elig_mask = gates.eligible(user.fico, user.dti, user.annual_income, user.state_index)
@@ -422,6 +567,12 @@ class SyntheticFintechDataGenerator:
                 y_approve = y_apply * (rng.random(k) < p_approve).astype(np.int64)
                 mu = np.array(_FAMILY_LOG_AMOUNT_MU)[fam] + 0.002 * (user.fico - 600)
                 amounts = y_approve * np.round(np.exp(mu + 0.5 * rng.normal(size=k)), 2)
+                # v2: serving time and decision delays (drawn after the inherited fields)
+                served_at = float(
+                    np.round(rng.uniform(snapshot - cfg.served_window_days, snapshot), 3)
+                )
+                delays = sample_decision_delay(rng, fam, 1 - y_approve, cfg.delay)
+                delays = np.where(y_apply == 1, delays, 0.0)
 
                 slates.append(
                     ImpressionSlate(
@@ -437,6 +588,8 @@ class SyntheticFintechDataGenerator:
                         payouts=tuple(float(v) for v in gates.payout[cand]),
                         amounts=tuple(float(v) for v in amounts),
                         eligible=tuple(bool(v) for v in elig),
+                        served_at_days=served_at,
+                        decision_delay_days=tuple(float(v) for v in delays),
                     )
                 )
                 slate_id += 1
@@ -447,7 +600,9 @@ class SyntheticFintechDataGenerator:
         products = self.generate_products()
         gates = _GateArrays.from_products(products)
         users = self.generate_users(gates)
-        interactions, affinities = self.generate_interactions(users, products, gates)
+        interactions, affinities, updates = self.generate_interactions(users, products, gates)
+        # Pending context and hard pulls are known only after the histories exist.
+        users = [u.model_copy(update=upd) for u, upd in zip(users, updates, strict=True)]
         slates = self.generate_slates(users, gates, affinities)
 
         n = len(products)
@@ -475,6 +630,7 @@ class SyntheticFintechDataGenerator:
             catalog_features=catalog,
             user_features=user_feats,
             item_counts=counts,
+            snapshot_at_days=self.config.snapshot_at_days,
             catalog_mean=catalog_mean,
             catalog_std=catalog_std,
         )
@@ -519,6 +675,7 @@ def save_dataset(
         "num_users": ds.num_users,
         "num_interactions": len(ds.interactions),
         "num_slates": len(ds.slates),
+        "snapshot_at_days": ds.snapshot_at_days,
         "config": asdict(config) if config is not None else None,
         "sha256": {name: _sha256(out / name) for name in ("products.jsonl", "users.jsonl")},
     }
@@ -528,8 +685,13 @@ def save_dataset(
 def load_dataset(in_dir: str | Path) -> SyntheticDataset:
     src = Path(in_dir)
     meta = json.loads((src / "meta.json").read_text(encoding="utf-8"))
-    if meta.get("format_version") != FORMAT_VERSION:
-        raise ValueError(f"unsupported dataset format_version={meta.get('format_version')}")
+    version = meta.get("format_version")
+    if version != FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported dataset format_version={version} (expected {FORMAT_VERSION}); "
+            "v1 slates carry no served_at_days / decision_delay_days, which have no safe "
+            "default — regenerate the dataset"
+        )
 
     def _load(path: Path, model: Any) -> list[Any]:
         with path.open(encoding="utf-8") as f:
@@ -544,6 +706,7 @@ def load_dataset(in_dir: str | Path) -> SyntheticDataset:
         catalog_features=arrays["catalog_features"],
         user_features=arrays["user_features"],
         item_counts=arrays["item_counts"],
+        snapshot_at_days=float(meta["snapshot_at_days"]),
         catalog_mean=arrays["catalog_mean"],
         catalog_std=arrays["catalog_std"],
     )
@@ -558,6 +721,10 @@ def dataset_summary(ds: SyntheticDataset) -> dict[str, float]:
     y_click = np.array([v for s in ds.slates for v in s.y_click], dtype=np.float64)
     y_apply = np.array([v for s in ds.slates for v in s.y_apply], dtype=np.float64)
     y_approve = np.array([v for s in ds.slates for v in s.y_approve], dtype=np.float64)
+    served = np.array([s.served_at_days for s in ds.slates for _ in s.y_apply], dtype=np.float64)
+    delays = np.array([v for s in ds.slates for v in s.decision_delay_days], dtype=np.float64)
+    status = observed_status(y_apply, served, delays, ds.snapshot_at_days, y_approve)
+    n_pending = float((status == int(ApplicationStatus.PENDING)).sum())
     ficos = np.array([u.fico for u in ds.users], dtype=np.float64)
     dtis = np.array([u.dti for u in ds.users], dtype=np.float64)
     tiers = {f.value: 0 for f in ProductFamily}
@@ -571,6 +738,8 @@ def dataset_summary(ds: SyntheticDataset) -> dict[str, float]:
         "frac_score_change_events": float((actions == ActionType.SCORE_CHANGE).mean()),
         "frac_apply_declined_events": float((actions == ActionType.APPLY_DECLINED).mean()),
         "frac_apply_approved_events": float((actions == ActionType.APPLY_APPROVED).mean()),
+        "frac_apply_pending_events": float((actions == ActionType.APPLY_PENDING).mean()),
+        "pending_rate_given_apply": float(n_pending / max(y_apply.sum(), 1.0)),
         "impressions": float(n_imp),
         "ctr": float(y_click.sum() / n_imp),
         "apply_rate_given_click": float(y_apply.sum() / max(y_click.sum(), 1.0)),

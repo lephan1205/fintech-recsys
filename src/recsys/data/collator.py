@@ -28,6 +28,7 @@ from recsys.data.schema import (
     PAD_ACTION_ID,
     PAD_ITEM_ID,
     POSITIVE_ACTIONS,
+    ActionType,
     InteractionRecord,
 )
 
@@ -58,6 +59,12 @@ class SequenceBatch:
     def seq_len(self) -> int:
         return int(self.item_ids.shape[1])
 
+    @property
+    def target_is_pending(self) -> torch.Tensor:
+        """(B,) bool: the target is an application whose decision is not yet observed."""
+        out: torch.Tensor = self.target_action_ids == int(ActionType.APPLY_PENDING)
+        return out
+
     def to(self, device: torch.device | str) -> SequenceBatch:
         kwargs = {
             f.name: (
@@ -84,8 +91,18 @@ class SequenceCollator:
         self.padding_side: PaddingSide = padding_side
         self.max_future = max_future
 
-    def __call__(self, records: Sequence[InteractionRecord]) -> SequenceBatch:
+    def __call__(
+        self,
+        records: Sequence[InteractionRecord],
+        cutoff_days: Sequence[float] | None = None,
+    ) -> SequenceBatch:
+        """Collate ``records``; ``cutoff_days[i]`` (optional) drops every history event of
+        record ``i`` with ``timestamp > cutoff`` so a slate only sees what preceded it.
+        A record whose history is emptied by the cutoff keeps its single earliest event,
+        so every row has at least one real token (the mask is never all-False)."""
         b, L, F = len(records), self.max_len, self.max_future
+        if cutoff_days is not None and len(cutoff_days) != b:
+            raise ValueError("cutoff_days must have one entry per record")
         item_ids = torch.full((b, L), PAD_ITEM_ID, dtype=torch.int64)
         action_ids = torch.full((b, L), PAD_ACTION_ID, dtype=torch.int64)
         time_deltas = torch.zeros((b, L), dtype=torch.float32)
@@ -97,7 +114,11 @@ class SequenceCollator:
         user_indices = torch.zeros(b, dtype=torch.int64)
 
         for i, rec in enumerate(records):
-            events = rec.history[-L:]  # keep the most recent L events
+            history = rec.history
+            if cutoff_days is not None:
+                kept = tuple(e for e in history if e.timestamp <= cutoff_days[i])
+                history = kept if kept else history[:1]
+            events = history[-L:]  # keep the most recent L events
             n = len(events)
             lengths[i] = n
             items = [e.item_id for e in events]

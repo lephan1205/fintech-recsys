@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -11,19 +12,29 @@ from pydantic import ValidationError
 
 from recsys import seed_everything
 from recsys.data.schema import (
+    APPLY_ACTIONS,
+    NUM_FAMILIES,
+    POSITIVE_ACTIONS,
+    PRODUCT_FEATURE_DIM,
+    USER_FEATURE_DIM,
     ActionType,
+    ApplicationStatus,
     CreditTier,
+    DelayConfig,
     FinancialProduct,
     ImpressionSlate,
     InteractionEvent,
     ProductFamily,
     SyntheticDataset,
     UserProfile,
+    observed_status,
 )
 from recsys.data.synthetic_generator import (
+    FORMAT_VERSION,
     GeneratorConfig,
     SyntheticFintechDataGenerator,
     approve_probability,
+    dataset_summary,
     load_dataset,
     save_dataset,
 )
@@ -66,8 +77,53 @@ def _product(**overrides: object) -> FinancialProduct:
 
 
 def test_action_type_values() -> None:
-    assert [a.value for a in ActionType] == [0, 1, 2, 3, 4, 5]
+    assert [a.value for a in ActionType] == [0, 1, 2, 3, 4, 5, 6]
     assert ActionType.PAD.value == 0 and ActionType.SCORE_CHANGE.value == 2
+    assert ActionType.APPLY_PENDING.value == 6
+    assert ActionType.APPLY_PENDING in POSITIVE_ACTIONS
+    assert {
+        ActionType.APPLY_APPROVED, ActionType.APPLY_DECLINED, ActionType.APPLY_PENDING
+    } == APPLY_ACTIONS  # fmt: skip
+    assert ActionType.APPLY_DECLINED not in POSITIVE_ACTIONS
+
+
+def test_defaults_keep_reference_style_objects_valid() -> None:
+    """Every §4.1 extension is defaulted, so v1-shaped products / users still validate."""
+    p = _product()
+    assert p.intro_apr_months == 0 and p.signup_bonus_value == 0.0 and p.closing_costs == 0.0
+    assert p.to_feature_vector().shape == (PRODUCT_FEATURE_DIM,) == (18,)
+    u = UserProfile(user_index=0, fico=700, dti=0.2, annual_income=5e4, state="CA")
+    assert u.pending_product_ids == () and u.recent_hard_pulls_30d == 0
+    vec = u.to_feature_vector()
+    assert vec.shape == (USER_FEATURE_DIM,) == (26,)
+    assert vec[16 + u.tier_index] == 1.0 and vec[21:].sum() == 0.0
+    pend = u.model_copy(update={"pending_product_ids": (3,), "pending_family_ids": (4,)})
+    assert pend.to_feature_vector()[21 + 4] == 1.0
+    with pytest.raises(ValidationError):
+        UserProfile(user_index=0, fico=700, dti=0.2, annual_income=5e4, state="CA",
+                    pending_family_ids=(NUM_FAMILIES,))  # fmt: skip
+    with pytest.raises(ValidationError):
+        UserProfile(user_index=0, fico=700, dti=0.2, annual_income=5e4, state="CA",
+                    pending_product_ids=(0,))  # fmt: skip
+    bt = _product(intro_apr_months=18, balance_transfer_fee_rate=0.03, signup_bonus_value=200.0)
+    v = bt.to_feature_vector()
+    assert v[13] == 18 / 24 and v[14] == pytest.approx(0.3) and v[16] > 0.0
+
+
+def test_observed_status_and_delay_config() -> None:
+    kw = dict(served_at_days=100.0, decision_delay_days=10.0)
+    assert observed_status(0, 0, snapshot_at_days=105.0, **kw) is ApplicationStatus.NOT_APPLIED
+    assert observed_status(1, 1, snapshot_at_days=105.0, **kw) is ApplicationStatus.PENDING
+    assert observed_status(1, 1, snapshot_at_days=110.0, **kw) is ApplicationStatus.APPROVED
+    assert observed_status(1, 0, snapshot_at_days=110.0, **kw) is ApplicationStatus.DECLINED
+    cfg = DelayConfig()
+    assert len(cfg.p_instant) == NUM_FAMILIES and cfg.instant_delay_days > 0.0
+    with pytest.raises(ValueError):
+        DelayConfig(p_instant=((1.5, 0.0),) * NUM_FAMILIES)
+    with pytest.raises(ValueError):
+        DelayConfig(log_sigma=((0.0, 0.1),) * NUM_FAMILIES)
+    with pytest.raises(ValueError):
+        GeneratorConfig(family_mix=(1.0, 0.0, 0.0))
 
 
 @pytest.mark.parametrize(
@@ -107,6 +163,8 @@ def test_slate_funnel_monotonicity_validated() -> None:
         p_approve=(0.5, 0.0),
         payouts=(10.0, 20.0),
         eligible=(True, False),
+        served_at_days=10.0,
+        decision_delay_days=(2.0, 0.0),
     )
     ImpressionSlate.model_validate(
         {
@@ -117,6 +175,37 @@ def test_slate_funnel_monotonicity_validated() -> None:
             "amounts": (500.0, 0.0),
         }
     )
+    with pytest.raises(ValidationError):  # decision delay without an application
+        ImpressionSlate.model_validate(
+            {
+                **kwargs,
+                "y_click": (1, 0),
+                "y_apply": (0, 0),
+                "y_approve": (0, 0),
+                "amounts": (0.0, 0.0),
+            }
+        )
+    with pytest.raises(ValidationError):  # application without a decision delay
+        ImpressionSlate.model_validate(
+            {
+                **kwargs,
+                "decision_delay_days": (0.0, 0.0),
+                "y_click": (1, 0),
+                "y_apply": (1, 0),
+                "y_approve": (0, 0),
+                "amounts": (0.0, 0.0),
+            }
+        )
+    with pytest.raises(ValidationError):  # served_at_days / decision_delay_days are required
+        ImpressionSlate.model_validate(
+            {
+                **{k: v for k, v in kwargs.items() if k != "served_at_days"},
+                "y_click": (0, 0),
+                "y_apply": (0, 0),
+                "y_approve": (0, 0),
+                "amounts": (0.0, 0.0),
+            }
+        )
     with pytest.raises(ValidationError):  # apply without click
         ImpressionSlate.model_validate(
             {
@@ -226,6 +315,56 @@ def test_history_contains_score_change_and_declines(
     assert n_score > 0 and n_declined > 0 and n_approved > 0
 
 
+def test_pending_events_and_user_pending_context(
+    small_dataset: tuple[SyntheticDataset, SyntheticFintechDataGenerator],
+) -> None:
+    """Histories end near the snapshot, contain APPLY_PENDING events, and the user's
+    pending_product_ids / pending_family_ids agree with those events."""
+    ds, _ = small_dataset
+    snap = ds.snapshot_at_days
+    assert snap == SMALL.snapshot_at_days
+    family = ds.family_by_item()
+    n_pending, n_users_pending = 0, 0
+    for rec, user in zip(ds.interactions, ds.users, strict=True):
+        # the future window may repeat the target, so dedupe (events are frozen / hashable)
+        events = tuple({*rec.history, rec.target, *rec.future_window})
+        assert all(e.timestamp >= 0.0 for e in events)
+        assert rec.target.timestamp <= snap
+        pending_seen = {e.item_id for e in events if e.action == ActionType.APPLY_PENDING}
+        n_pending += len(pending_seen)
+        # every pending event visible in the record is in the user's pending context
+        assert pending_seen <= set(user.pending_product_ids)
+        assert set(user.pending_family_ids) == {int(family[i]) for i in user.pending_product_ids}
+        assert (
+            user.recent_hard_pulls_30d
+            >= sum(
+                1 for e in events if e.action in APPLY_ACTIONS and snap - 30.0 < e.timestamp <= snap
+            )
+            - 0
+        )  # Poisson component is non-negative
+        if user.pending_product_ids:
+            n_users_pending += 1
+    assert n_pending > 0 and n_users_pending > 0
+    # financial state is drawn for everyone and correlates with the credit profile
+    assert all(u.revolving_apr > 0.0 and u.annual_card_spend > 0.0 for u in ds.users)
+    assert any(u.mortgage_balance > 0.0 for u in ds.users)
+
+
+def test_slate_delays_and_summary(
+    small_dataset: tuple[SyntheticDataset, SyntheticFintechDataGenerator],
+) -> None:
+    ds, _ = small_dataset
+    snap = ds.snapshot_at_days
+    for s in ds.slates:
+        assert snap - SMALL.served_window_days <= s.served_at_days <= snap
+        for ya, d in zip(s.y_apply, s.decision_delay_days, strict=True):
+            assert (d > 0.0) == (ya == 1)
+    summary = dataset_summary(ds)
+    assert summary["frac_apply_pending_events"] > 0.0
+    assert 0.0 < summary["pending_rate_given_apply"] < 1.0
+    assert summary["impressions"] == len(ds.slates) * SMALL.slate_size
+
+
 def test_slate_labels_consistent_with_true_probs(
     small_dataset: tuple[SyntheticDataset, SyntheticFintechDataGenerator],
 ) -> None:
@@ -249,9 +388,12 @@ def test_item_counts_and_features(
     small_dataset: tuple[SyntheticDataset, SyntheticFintechDataGenerator],
 ) -> None:
     ds, _ = small_dataset
-    assert ds.catalog_features.shape == (ds.num_items + 1, 13)
+    assert ds.catalog_features.shape == (ds.num_items + 1, PRODUCT_FEATURE_DIM)
     assert np.all(ds.catalog_features[0] == 0)
-    assert ds.user_features.shape == (ds.num_users, 9)
+    assert ds.user_features.shape == (ds.num_users, USER_FEATURE_DIM)
+    # user_features is rebuilt after the pending context is filled in
+    idx = next(i for i, u in enumerate(ds.users) if u.pending_family_ids)
+    assert ds.user_features[idx, 21 + ds.users[idx].pending_family_ids[0]] == 1.0
     assert ds.item_counts.shape == (ds.num_items + 1,)
     assert ds.item_counts[0] == 0
     total = sum(len(r.history) + 1 for r in ds.interactions)
@@ -271,3 +413,17 @@ def test_roundtrip_save_load(
     assert back.slates == ds.slates
     assert np.allclose(back.catalog_features, ds.catalog_features)
     assert np.array_equal(back.item_counts, ds.item_counts)
+    assert back.snapshot_at_days == ds.snapshot_at_days
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    assert meta["format_version"] == FORMAT_VERSION == 2
+    assert meta["snapshot_at_days"] == ds.snapshot_at_days
+
+
+def test_load_rejects_format_version_1(tmp_path: Path) -> None:
+    ds = SyntheticFintechDataGenerator(SMALL).generate()
+    save_dataset(ds, tmp_path, SMALL)
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    meta["format_version"] = 1
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="format_version=1"):
+        load_dataset(tmp_path)

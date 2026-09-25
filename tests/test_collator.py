@@ -21,6 +21,8 @@ from recsys.data.schema import (
     PRODUCT_FEATURE_DIM,
     USER_FEATURE_DIM,
     ActionType,
+    ApplicationStatus,
+    DelayConfig,
     ImpressionSlate,
     InteractionEvent,
     InteractionRecord,
@@ -206,6 +208,8 @@ def test_impression_collator_shapes_and_funnel() -> None:
             payouts=(100.0, 200.0, 300.0),
             amounts=(5000.0, 0.0, 0.0),
             eligible=(True, False, True),
+            served_at_days=100.0,
+            decision_delay_days=(0.5, 0.0, 0.0),
         ),
         ImpressionSlate(
             user_index=2,
@@ -220,9 +224,13 @@ def test_impression_collator_shapes_and_funnel() -> None:
             payouts=(1.0, 2.0),
             amounts=(0.0, 0.0),
             eligible=(True, True),
+            served_at_days=120.0,
+            decision_delay_days=(0.0, 0.0),
         ),
     ]
-    batch = ImpressionCollator(catalog, users, family)(slates)
+    batch = ImpressionCollator(
+        catalog, users, family, snapshot_at_days=365.0, delay_config=DelayConfig()
+    )(slates)
     assert batch.candidate_item_ids.shape == (2, 3)
     assert batch.candidate_mask.tolist() == [[True, True, True], [True, True, False]]
     assert batch.family_ids.tolist() == [[0, 1, 2], [3, 4, -1]]
@@ -234,3 +242,95 @@ def test_impression_collator_shapes_and_funnel() -> None:
     assert batch.eligible.dtype == torch.bool
     assert batch.y_approve[0].tolist() == [1.0, 0.0, 0.0]
     assert batch.amounts[0, 0].item() == 5000.0
+    # v2 fields: everything resolved at a late snapshot
+    assert batch.served_at_days.tolist() == [100.0, 120.0]
+    assert batch.elapsed_days[0].tolist() == [265.0, 265.0, 265.0]
+    assert batch.status[0].tolist() == [int(ApplicationStatus.APPROVED), 0, 0]
+    assert batch.approve_observed.all()
+    assert batch.approve_weight.tolist() == [[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]]  # masked slot 0
+    assert not batch.pending_family_mask.any()
+    assert torch.equal(batch.y_approve_oracle, batch.y_approve)
+
+
+def _pending_slate() -> ImpressionSlate:
+    """Candidate 0 applied on day 100 with a 10-day decision; candidate 1 resolved instantly."""
+    return ImpressionSlate(
+        user_index=0,
+        slate_id=0,
+        candidate_item_ids=(1, 2, 3),
+        y_click=(1, 1, 0),
+        y_apply=(1, 1, 0),
+        y_approve=(1, 0, 0),
+        p_click=(0.5, 0.5, 0.1),
+        p_apply=(0.4, 0.4, 0.2),
+        p_approve=(0.9, 0.5, 0.5),
+        payouts=(100.0, 200.0, 300.0),
+        amounts=(5000.0, 0.0, 0.0),
+        eligible=(True, True, True),
+        served_at_days=100.0,
+        decision_delay_days=(10.0, 0.01, 0.0),
+    )
+
+
+@pytest.mark.parametrize("policy", ["drop", "ipw", "negative"])
+def test_impression_collator_observed_view_at_young_snapshot(policy: str) -> None:
+    catalog = np.random.rand(4, PRODUCT_FEATURE_DIM).astype(np.float32)
+    users = np.random.rand(1, USER_FEATURE_DIM).astype(np.float32)
+    family = np.array([-1, 4, 0, 2], dtype=np.int64)  # item 1 is a mortgage
+    pending_fams = np.zeros((1, 5), dtype=bool)
+    pending_fams[0, 4] = True
+    coll = ImpressionCollator(
+        catalog, users, family,
+        snapshot_at_days=105.0, delay_config=DelayConfig(),
+        pending_policy=policy, user_pending_families=pending_fams,  # type: ignore[arg-type]
+    )  # fmt: skip
+    batch = coll([_pending_slate()])
+    assert batch.status[0].tolist() == [
+        int(ApplicationStatus.PENDING), int(ApplicationStatus.DECLINED),
+        int(ApplicationStatus.NOT_APPLIED),
+    ]  # fmt: skip
+    assert batch.approve_observed[0].tolist() == [False, True, True]
+    # observed view: the pending row's oracle label / amount must not leak
+    assert batch.y_approve[0].tolist() == [0.0, 0.0, 0.0]
+    assert batch.amounts[0].tolist() == [0.0, 0.0, 0.0]
+    assert batch.y_approve_oracle[0].tolist() == [1.0, 0.0, 0.0]
+    assert batch.amounts_oracle[0, 0].item() == 5000.0
+    w = batch.approve_weight[0].tolist()
+    if policy == "negative":
+        assert w == [1.0, 1.0, 1.0]
+    else:
+        assert w[0] == 0.0 and w[2] == 1.0
+        assert w[1] == 1.0 if policy == "drop" else w[1] >= 1.0
+    assert batch.pending_family_mask[0].tolist() == [True, False, False]
+
+
+def test_impression_collator_requires_snapshot() -> None:
+    catalog = np.zeros((2, PRODUCT_FEATURE_DIM), dtype=np.float32)
+    users = np.zeros((1, USER_FEATURE_DIM), dtype=np.float32)
+    with pytest.raises(TypeError):
+        ImpressionCollator(catalog, users, np.array([-1, 0]))  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        ImpressionCollator(
+            catalog, users, np.array([-1, 0]), snapshot_at_days=1.0,
+            delay_config=DelayConfig(), pending_policy="sometimes",  # type: ignore[arg-type]
+        )  # fmt: skip
+
+
+# ------------------------------------------------------------ cutoff / pending target
+
+
+def test_sequence_collator_cutoff_and_pending_target() -> None:
+    rec = InteractionRecord(
+        user_index=0,
+        history=tuple(ev(i, ActionType.VIEW, float(i) * 2.0) for i in range(1, 7)),
+        target=ev(9, ActionType.APPLY_PENDING, 14.0),
+    )
+    full = SequenceCollator(max_len=8)([rec])
+    cut = SequenceCollator(max_len=8)([rec], cutoff_days=[6.0])
+    assert full.lengths.tolist() == [6] and cut.lengths.tolist() == [3]
+    assert cut.item_ids[0].tolist()[-3:] == [1, 2, 3]
+    assert full.target_is_pending.tolist() == [True]
+    emptied = SequenceCollator(max_len=8)([rec], cutoff_days=[0.5])
+    assert emptied.lengths.tolist() == [1] and emptied.attention_mask.any()
+    with pytest.raises(ValueError):
+        SequenceCollator(max_len=8)([rec], cutoff_days=[1.0, 2.0])
