@@ -30,6 +30,7 @@ recsys = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q -p no:cacheprovider"
 filterwarnings = ["ignore::DeprecationWarning"]
 

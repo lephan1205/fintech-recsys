@@ -113,6 +113,7 @@ class ImpressionCollator:
         pending_policy: PendingPolicy = "drop",
         w_floor: float = 0.05,
         user_pending_families: npt.NDArray[np.bool_] | None = None,
+        payout_by_item: npt.NDArray[np.float64] | None = None,
         slate_size: int | None = None,
     ) -> None:
         if pending_policy not in ("drop", "ipw", "negative"):
@@ -127,6 +128,9 @@ class ImpressionCollator:
         if user_pending_families is None:
             user_pending_families = np.zeros((self.user_features.shape[0], NUM_FAMILIES), bool)
         self.user_pending_families = torch.as_tensor(user_pending_families, dtype=torch.bool)
+        self.payout_by_item = (
+            None if payout_by_item is None else torch.as_tensor(payout_by_item, dtype=torch.float32)
+        )
         self.slate_size = slate_size
 
     def __call__(self, slates: Sequence[ImpressionSlate]) -> ImpressionBatch:
@@ -209,4 +213,58 @@ class ImpressionCollator:
             pending_family_mask=pending_family_mask,
             y_approve_oracle=y_approve_oracle,
             amounts_oracle=amounts_oracle,
+        )
+
+    def collate_candidates(
+        self,
+        user_indices: npt.NDArray[np.int64] | torch.Tensor,
+        candidate_ids: npt.NDArray[np.int64] | torch.Tensor,
+        served_at_days: float | None = None,
+    ) -> ImpressionBatch:
+        """Label-free batch for *serving*: ``(B,)`` users x ``(B, K)`` retrieved candidates.
+
+        Labels / statuses are zeros, ``candidate_mask`` is ``ids > 0``, payouts come from
+        ``payout_by_item`` (zeros if not provided) and ``served_at_days`` defaults to the
+        snapshot ("now").
+        """
+        user_idx = torch.as_tensor(np.asarray(user_indices), dtype=torch.int64)
+        ids = torch.as_tensor(np.asarray(candidate_ids), dtype=torch.int64)
+        b, k = ids.shape
+        mask = ids > 0
+        zeros = torch.zeros((b, k), dtype=torch.float32)
+        served = torch.full(
+            (b,), self.snapshot_at_days if served_at_days is None else served_at_days
+        )
+        cand_feat = self.catalog_features[ids]
+        user_feat = self.user_features[user_idx]
+        family = torch.where(mask, self.family_by_item[ids], torch.full_like(ids, -1))
+        tabular = torch.cat([user_feat.unsqueeze(1).expand(-1, k, -1), cand_feat], dim=-1)
+        payouts = zeros if self.payout_by_item is None else self.payout_by_item[ids] * mask
+        pending_fam = self.user_pending_families[user_idx]
+        pending_family_mask = pending_fam.gather(1, torch.clamp(family, min=0)) & mask
+        return ImpressionBatch(
+            user_indices=user_idx,
+            user_features=user_feat,
+            candidate_item_ids=ids,
+            candidate_features=cand_feat,
+            family_ids=family,
+            tabular=tabular,
+            y_click=zeros.clone(),
+            y_apply=zeros.clone(),
+            y_approve=zeros.clone(),
+            p_click=zeros.clone(),
+            p_apply=zeros.clone(),
+            p_approve=zeros.clone(),
+            payouts=payouts,
+            amounts=zeros.clone(),
+            eligible=mask.clone(),
+            candidate_mask=mask,
+            served_at_days=served,
+            elapsed_days=(self.snapshot_at_days - served).unsqueeze(1).expand(-1, k).contiguous(),
+            status=torch.zeros((b, k), dtype=torch.int64),
+            approve_observed=torch.ones((b, k), dtype=torch.bool),
+            approve_weight=mask.to(torch.float32),
+            pending_family_mask=pending_family_mask,
+            y_approve_oracle=zeros.clone(),
+            amounts_oracle=zeros.clone(),
         )
