@@ -489,6 +489,7 @@ class ScoredSlates:
     p_approve_true: npt.NDArray[np.float64]
     approve_observed: npt.NDArray[np.bool_]
     approve_weight: npt.NDArray[np.float64]
+    status: npt.NDArray[np.int64]  # ApplicationStatus per row
     candidate_mask: npt.NDArray[np.bool_]
     user_indices: npt.NDArray[np.int64]  # per row
     family_ids: npt.NDArray[np.int64]
@@ -527,6 +528,7 @@ def score_slates(
         add("p_apply_true", b.p_apply.numpy().astype(np.float64))
         add("p_approve_true", b.p_approve.numpy().astype(np.float64))
         add("approve_observed", b.approve_observed.numpy())
+        add("status", b.status.numpy())
         add("candidate_mask", b.candidate_mask.numpy())
         add("user_indices", np.repeat(b.user_indices.numpy(), k))
         add("family_ids", b.family_ids.numpy())

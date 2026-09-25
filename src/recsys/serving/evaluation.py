@@ -20,6 +20,7 @@ from recsys.data.schema import (
     FAMILY_ORDER,
     NUM_FAMILIES,
     TIER_ORDER,
+    ApplicationStatus,
     ImpressionSlate,
     InteractionRecord,
     SyntheticDataset,
@@ -232,6 +233,20 @@ def funnel_tables(art: PipelineArtifacts, scored: ScoredSlates) -> FunnelTables:
             "NCE": normalized_cross_entropy(y[sel], p[sel], ws),
             "ECE": expected_calibration_error(p[sel], y[sel], weights=ws),
         }
+    ceiling: dict[str, dict[str, float]] = {}
+    for name, y, p, sel, wt in (
+        ("click", scored.y_click, scored.p_click_true, m, None),
+        ("apply | click", scored.y_apply, scored.p_apply_true, clicked, None),
+        ("approve | apply (resolved, weighted)", scored.y_approve, scored.p_approve_true,
+         resolved, w),
+    ):  # fmt: skip
+        ws = None if wt is None else wt[sel]
+        ceiling[name] = {
+            "AUC": auc(y[sel], p[sel], ws),
+            "PR-AUC": pr_auc(y[sel], p[sel], ws),
+            "GAUC": gauc(y[sel], p[sel], groups[sel], ws),
+            "NCE": normalized_cross_entropy(y[sel], p[sel], ws),
+        }
     pf = p1 * p2 * p3
     realized = float((scored.y_approve * scored.payouts * m * scored.approve_observed).sum())
     expected = float((pf * scored.payouts * m).sum())
@@ -257,12 +272,82 @@ def funnel_tables(art: PipelineArtifacts, scored: ScoredSlates) -> FunnelTables:
         f"pending applications are excluded, D4); expected revenue Σ P_funded · payout: "
         f"${expected:,.0f}.\n"
     )
-    pending_rows = int((m & (scored.y_apply > 0.5) & ~scored.approve_observed).sum())
+    md += (
+        "\n## Oracle ceiling (the generator's own probabilities scored on the same rows)\n\n"
+        "Labels are Bernoulli draws from these probabilities, so no model can beat this "
+        "ordering in expectation.\n\n"
+    )
+    md += md_table(
+        ("task", "AUC", "PR-AUC", "GAUC", "NCE"),
+        [(k, v["AUC"], v["PR-AUC"], v["GAUC"], v["NCE"]) for k, v in ceiling.items()],
+    )
+    is_pending = scored.status == int(ApplicationStatus.PENDING)
+    pending_rows = int((m & (scored.y_apply > 0.5) & is_pending).sum())
     md += (
         "Pending applications in the test split (excluded from approval metrics): "
         f"{pending_rows}.\n"
     )
     return FunnelTables(md, metrics)
+
+
+def training_summary_markdown(histories: dict[str, Any], cfg: TrainingConfig) -> str:
+    """One row per model from ``artifacts/histories.json``: steps run, selection criterion,
+    best step / value, early stop, wall time; plus RQ-VAE utilization per level."""
+    criteria = {
+        "rqvae": f"recon MSE s.t. min utilization >= {cfg.rqvae_min_utilization:g}",
+        "tiger": "val Recall@100 (checkpoint), val next-SID loss (stop)",
+        "ranker": "val unified funnel loss (total)",
+        "prm": "val listwise loss",
+    }
+    budgets = {
+        "rqvae": cfg.rqvae_optimizer.total_steps,
+        "tiger": cfg.tiger_optimizer.total_steps,
+        "ranker": cfg.ranker_optimizer.total_steps,
+        "prm": cfg.prm_optimizer.total_steps,
+    }
+    rows = []
+    for name in ("rqvae", "tiger", "ranker", "prm"):
+        h = histories.get(name)
+        if not h:
+            continue
+        rows.append(
+            (
+                name,
+                int(len(h.get("train_loss", []))),
+                int(budgets[name]),
+                criteria[name],
+                int(h.get("best_step", -1)),
+                float(h.get("best_value", float("nan"))),
+                "yes" if h.get("stopped_early") else "no",
+                float(h.get("seconds", 0.0)),
+            )
+        )
+    md = "# Training summary (from artifacts/histories.json)\n\n"
+    md += md_table(
+        (
+            "model", "steps run", "step budget", "selection criterion", "best step", "best value",
+            "early stop", "seconds",
+        ),
+        rows,
+    )  # fmt: skip
+    rq = histories.get("rqvae", {})
+    evals = rq.get("evaluations", [])
+    if evals:
+        last = evals[-1]
+        util = [(k, float(v)) for k, v in last.items() if k.startswith("utilization_")]
+        md += "\n## RQ-VAE codebook utilization at the last evaluation\n\n"
+        md += md_table(("level", "utilization"), [(k.split("_")[1], v) for k, v in util])
+        md += (
+            f"\nUtilization constraint met: "
+            f"{'yes' if rq.get('extra', {}).get('utilization_constraint_met') else 'no'}.\n"
+        )
+    extra = histories.get("ranker", {}).get("extra", {})
+    if "num_trainable_parameters" in extra:
+        md += f"\nRanker trainable parameters: {int(extra['num_trainable_parameters'])}.\n"
+    prm_extra = histories.get("prm", {}).get("extra", {})
+    if "num_train_slates" in prm_extra:
+        md += f"PRM training slates (>= 1 positive): {int(prm_extra['num_train_slates'])}.\n"
+    return md
 
 
 def positives_per_batch_markdown(histories: dict[str, Any], cfg: TrainingConfig) -> str:
@@ -402,7 +487,7 @@ def pending_policy_ablation(
         bias = float(p3[mort].mean() - truth[mort].mean())
         a = auc(scored.y_approve_oracle[mort], p3[mort])
         ece = expected_calibration_error(p3[mort], scored.y_approve_oracle[mort])
-        pending_share = float((~scored.approve_observed[mort]).mean())
+        pending_share = float((scored.status[mort] == int(ApplicationStatus.PENDING)).mean())
         rows.append(
             (
                 policy,

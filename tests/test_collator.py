@@ -289,7 +289,9 @@ def test_impression_collator_observed_view_at_young_snapshot(policy: str) -> Non
         int(ApplicationStatus.PENDING), int(ApplicationStatus.DECLINED),
         int(ApplicationStatus.NOT_APPLIED),
     ]  # fmt: skip
-    assert batch.approve_observed[0].tolist() == [False, True, True]
+    # "negative" is the wrong-by-construction baseline: pending rows count as observed declines
+    expected_observed = [True, True, True] if policy == "negative" else [False, True, True]
+    assert batch.approve_observed[0].tolist() == expected_observed
     # observed view: the pending row's oracle label / amount must not leak
     assert batch.y_approve[0].tolist() == [0.0, 0.0, 0.0]
     assert batch.amounts[0].tolist() == [0.0, 0.0, 0.0]

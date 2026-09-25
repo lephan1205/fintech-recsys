@@ -170,10 +170,17 @@ class ImpressionCollator:
             self.snapshot_at_days,
             y_approve_oracle.numpy(),
         )
-        observed_np = approve_observed(status_np)
+        resolved_np = approve_observed(status_np)
+        resolved = torch.as_tensor(resolved_np, dtype=torch.bool)
+        # observed view: the oracle label / amount of a pending row must never leak
+        y_approve = torch.where(resolved, y_approve_oracle, torch.zeros_like(y_approve_oracle))
+        amounts = torch.where(resolved, amounts_oracle, torch.zeros_like(amounts_oracle))
+        observed_np = resolved_np
+        if self.pending_policy == "negative":
+            # baseline (wrong by construction): a pending row enters the approval terms as
+            # an *observed* decline (y_approve = 0, weight 1) instead of being masked out
+            observed_np = np.ones_like(resolved_np)
         observed = torch.as_tensor(observed_np, dtype=torch.bool)
-        y_approve = torch.where(observed, y_approve_oracle, torch.zeros_like(y_approve_oracle))
-        amounts = torch.where(observed, amounts_oracle, torch.zeros_like(amounts_oracle))
         weight_np = approve_weights(
             status_np,
             elapsed.numpy(),

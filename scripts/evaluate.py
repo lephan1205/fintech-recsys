@@ -6,8 +6,8 @@ Usage::
     python scripts/evaluate.py ... --skip-ablation          # skip the 3x ranker retraining
 
 Outputs: dataset_summary.md, retrieval_metrics.md, funnel_metrics.md,
-positives_per_batch.md, calibration.md, pending_policy_ablation.md, pareto_sweep.md,
-latency.md.
+positives_per_batch.md, training_summary.md, calibration.md, pending_policy_ablation.md,
+pareto_sweep.md, latency.md.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from recsys.serving.evaluation import (  # noqa: E402
     pending_policy_ablation,
     positives_per_batch_markdown,
     retrieval_tables,
+    training_summary_markdown,
 )
 from recsys.serving.pipeline import PipelineArtifacts  # noqa: E402
 from recsys.training.config import TrainingConfig  # noqa: E402
@@ -72,6 +73,7 @@ def main() -> None:
     calib_scored = score_slates(art, splits.slates(ds, "calib"))
     write("funnel_metrics.md", funnel_tables(art, test_scored).markdown)
     write("positives_per_batch.md", positives_per_batch_markdown(histories, cfg))
+    write("training_summary.md", training_summary_markdown(histories, cfg))
     write("calibration.md", calibration_tables(art, calib_scored, test_scored))
     write(
         "pareto_sweep.md",
