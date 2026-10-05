@@ -1,9 +1,10 @@
 """The write-up is checked against the code and the generated results.
 
-* Appendix A (the decision register) must list every ``RegisterRow`` by its exact name with
-  the value the config dataclasses actually default to.
-* Every numeric cell in every other table of ``docs/ARCHITECTURE.md`` must be copied from a
-  ``docs/results/*.md`` table (or be a config default from the register), never typed by hand.
+* ``docs/DECISION_REGISTER.md`` must list every ``RegisterRow`` by its exact name with the
+  value the config dataclasses actually default to.
+* Every numeric cell in every table of ``docs/ARCHITECTURE.md`` and ``docs/RESULTS.md`` must be
+  copied from a ``docs/results/*.md`` table (or be a config default from the register), never
+  typed by hand.
 * Both diagrams pass ``scripts/check_diagrams.py``.
 
 The whole module is skipped while ``docs/ARCHITECTURE.md`` does not exist, so the code
@@ -23,6 +24,8 @@ from recsys.training.config import decision_register
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "ARCHITECTURE.md"
+RESULTS_DOC = ROOT / "docs" / "RESULTS.md"
+REGISTER_DOC = ROOT / "docs" / "DECISION_REGISTER.md"
 RESULTS = ROOT / "docs" / "results"
 DIAGRAMS = ROOT / "docs" / "diagrams"
 
@@ -121,23 +124,19 @@ def test_required_sections_present(doc_text: str) -> None:
         "Stage 3",
         "Stage 4",
         "End-to-end serving",
-        "Experimental setup and results",
         "Limitations and future work",
         "References",
-        "Appendix A",
-        "Appendix B",
+        "Appendix",
     )
     for r in required:
         assert any(h.startswith(r) or r in h for h in heads), f"missing section {r!r}"
     prose = _prose_only(doc_text)
     words = len(re.findall(r"[A-Za-z][A-Za-z'’-]+", prose))
-    assert 8_000 <= words <= 13_000, f"write-up has {words} prose words; target 8k-12k"
+    assert words <= 12_000, f"write-up has {words} prose words; keep it under 12k"
 
 
-def test_register_matches_config_defaults(doc_text: str) -> None:
-    sections = _sections(doc_text)
-    key = next(h for h in sections if h.startswith("Appendix A"))
-    rows = [r for t in _tables(sections[key]) for r in t]
+def test_register_matches_config_defaults() -> None:
+    rows = [r for t in _tables(REGISTER_DOC.read_text(encoding="utf-8")) for r in t]
     by_name = {r[0].strip("`"): r for r in rows if r and r[0].startswith("`")}
     missing = []
     wrong = []
@@ -149,25 +148,23 @@ def test_register_matches_config_defaults(doc_text: str) -> None:
         value = row[1].strip("`")
         if value != reg.value:
             wrong.append((reg.name, value, reg.value))
-    assert not missing, f"register rows missing from Appendix A: {missing}"
-    assert not wrong, f"Appendix A values differ from config defaults (name, doc, code): {wrong}"
+    assert not missing, f"register rows missing from DECISION_REGISTER.md: {missing}"
+    assert not wrong, f"register values differ from config defaults (name, doc, code): {wrong}"
     # the header must carry the seven mandated columns
     header = rows[0]
     for col in ("parameter", "value", "config location", "why this value"):
-        assert any(col in c.lower() for c in header), f"Appendix A lacks column {col!r}"
+        assert any(col in c.lower() for c in header), f"register lacks column {col!r}"
 
 
 def test_every_numeric_table_cell_comes_from_results(
     doc_text: str, results_numbers: set[str]
 ) -> None:
-    sections = _sections(doc_text)
     register_values = {r.value for r in decision_register()}
     register_numbers = {_canonical(n) for v in register_values for n in _numbers_in_cell(v)}
     unsourced: list[tuple[str, str]] = []
-    for head, body in sections.items():
-        if head.startswith("Appendix A"):
-            continue
-        for table in _tables(body):
+    docs = (("ARCHITECTURE.md", doc_text), ("RESULTS.md", RESULTS_DOC.read_text("utf-8")))
+    for name, text in docs:
+        for table in _tables(text):
             for row in table:
                 for cell in row:
                     for num in _numbers_in_cell(cell):
@@ -176,13 +173,14 @@ def test_every_numeric_table_cell_comes_from_results(
                         key = _canonical(num)
                         if key in results_numbers or key in register_numbers:
                             continue
-                        unsourced.append((head, cell))
+                        unsourced.append((name, cell))
     assert not unsourced, f"table numbers not found in docs/results or the register: {unsourced}"
 
 
 def test_every_results_table_is_cited(doc_text: str) -> None:
+    cited = doc_text + RESULTS_DOC.read_text(encoding="utf-8")
     for f in sorted(RESULTS.glob("*.md")):
-        assert f.name in doc_text, f"{f.name} is never cited in the write-up"
+        assert f.name in cited, f"{f.name} is never cited in ARCHITECTURE.md or RESULTS.md"
 
 
 def test_diagrams_pass_checklist() -> None:

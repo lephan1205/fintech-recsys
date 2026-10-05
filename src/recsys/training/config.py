@@ -2,8 +2,8 @@
 
 One :class:`OptimizerConfig` per model, consumed by ``training/optim.py``; the model
 sizes of §2 / D6; the user split; negative down-sampling and pending policy.  Every
-default here is a row of the decision register (:func:`decision_register`) that the
-write-up's Appendix A must reproduce exactly (``tests/test_docs.py``).
+default here is a row of the decision register (:func:`decision_register`) that
+``docs/DECISION_REGISTER.md`` must reproduce exactly (``tests/test_docs.py``).
 """
 
 from __future__ import annotations

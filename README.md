@@ -1,12 +1,10 @@
 # fintech-recsys
 
 A four-stage credit-marketplace recommender (credit cards, balance-transfer cards, personal
-loans, auto refinance, mortgages) built for hard underwriting compliance, honest
-probabilities and a CPU scoring budget. Eligibility is enforced three times (a prefix-trie
-logit mask at generation, a post-retrieval gate, an output assertion); every learned
-probability is a proper-scoring-rule estimate that is calibrated before it is turned into
-dollars; business policy (`α`, guardrails, family diversity) lives at valuation and
-re-ranking time, never in a loss.
+loans, auto refinance, mortgages) with underwriting eligibility enforced three times: a
+prefix-trie logit mask at generation, a post-retrieval gate, and an output assertion. Every learned probability is a proper-scoring-rule estimate that is calibrated before 
+it is turned into dollars; business policy (guardrails, product family diversity) lives at valuation and
+re-ranking time.
 
 1. **TIGER generative retrieval** over RQ-VAE Semantic IDs, beam width 100, with the trie
    masking every code that cannot end in an eligible product.
@@ -19,9 +17,7 @@ re-ranking time, never in a loss.
    and a deterministic net user benefit combined under a serving-time `α`, suitability
    guardrails, and a Pre-LN transformer re-ranker that outputs an ordering only.
 
-The full design-review write-up, with placement rationale for every component, the decision
-register and the failure-mode table, is **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
-Every number there and below is copied from `docs/results/` (asserted by `tests/test_docs.py`).
+For a detailed discussion of the design, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Full measured results are in [docs/RESULTS.md](docs/RESULTS.md) and every tuned value with its rationale in [docs/DECISION_REGISTER.md](docs/DECISION_REGISTER.md).
 
 ![Serving pipeline](docs/diagrams/serving_pipeline.svg)
 
@@ -82,6 +78,6 @@ src/recsys/serving     eligibility engine, calibration, valuation stage, pipelin
 src/recsys/valuation   expected value, net user benefit, utility + guardrails, Pareto sweep
 src/recsys/training    configs + decision register, optimizers, splits, trainers
 scripts/               generate_dataset, train_all, evaluate, pareto_sweep, run_e2e_pipeline, check_diagrams
-docs/                  ARCHITECTURE.md, diagrams/, results/
+docs/                  ARCHITECTURE.md, RESULTS.md, DECISION_REGISTER.md, diagrams/, results/
 tests/                 127 tests; tests/test_docs.py ties the write-up to the code and results
 ```
