@@ -1,5 +1,10 @@
 # fintech-recsys
 
+> **Personal project** by [Le Phan](https://github.com/lephan1205), built independently in PyTorch.
+> **All data is synthetic**: it comes from the generator in `src/recsys/data/`. No real member,
+> product or company data is used, and the project is not affiliated with any employer or
+> credit marketplace.
+
 A four-stage credit-marketplace recommender (credit cards, balance-transfer cards, personal
 loans, auto refinance, mortgages) with underwriting eligibility enforced three times: a
 prefix-trie logit mask at generation, a post-retrieval gate, and an output assertion. Every learned probability is a proper-scoring-rule estimate that is calibrated before 
@@ -18,6 +23,28 @@ re-ranking time.
    guardrails, and a Pre-LN transformer re-ranker that outputs an ordering only.
 
 For a detailed discussion of the design, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Full measured results are in [docs/RESULTS.md](docs/RESULTS.md) and every tuned value with its rationale in [docs/DECISION_REGISTER.md](docs/DECISION_REGISTER.md).
+
+## Headline results
+
+Synthetic benchmark: 2 000 products, 3 000 members, 1.2 M impression rows, members split
+2100 / 300 / 300 / 300 (train / val / calib / test). Sources: `docs/results/*.md`.
+
+<!-- source: docs/results/retrieval_metrics.md, funnel_metrics.md, pareto_sweep.md, latency.md -->
+| metric | value | baseline / ceiling |
+|---|---|---|
+| Retrieval `Recall@100` (TIGER beam, eligible next-item positives) | 0.3379 | eligible-popularity 0.3836, eligible-random 0.1598 |
+| Retrieval `Recall@10` | 0.0868 | eligible-popularity 0.0548 |
+| Click AUC (calibrated) / ECE | 0.5353 / 0.0019 | oracle ceiling 0.6316 |
+| Apply-given-click AUC / ECE | 0.5754 / 0.0117 | oracle ceiling 0.6143 |
+| Approve-given-apply AUC / ECE | 0.7843 / 0.0280 | oracle ceiling 0.9251 |
+| Pareto at `α = 0.5`: revenue / user benefit / harm per slate ($) | 35.97 / 437.31 / 0.000 | `α = 1`: 47.41 / 308.46 / 0.160 |
+| Pending-policy bias on the mortgage slice (`drop` / `ipw` / `negative`) | 0.0659 / 0.1721 / -0.5909 | truth 0.6255 |
+| Serving latency p50, CPU, `B = 1` | 19.84 ms | target 10 ms; retrieval alone 16.5931 ms |
+| Eligibility violations in served slates | 0 | asserted by the pipeline |
+
+The latency target is missed by the TIGER beam (the decoder re-runs the history at each of
+four levels for 100 beams); the write-up analyzes the gap and the KV-cache mitigation rather
+than hiding it.
 
 ![Serving pipeline](docs/diagrams/serving_pipeline.svg)
 
@@ -44,28 +71,6 @@ python3 -m venv .venv
 # Quality gate
 .venv/bin/python -m pytest -q && .venv/bin/python -m mypy && .venv/bin/python -m ruff check . && .venv/bin/python scripts/check_diagrams.py
 ```
-
-## Headline results
-
-Synthetic benchmark: 2 000 products, 3 000 members, 1.2 M impression rows, members split
-2100 / 300 / 300 / 300 (train / val / calib / test). Sources: `docs/results/*.md`.
-
-<!-- source: docs/results/retrieval_metrics.md, funnel_metrics.md, pareto_sweep.md, latency.md -->
-| metric | value | baseline / ceiling |
-|---|---|---|
-| Retrieval `Recall@100` (TIGER beam, eligible next-item positives) | 0.3379 | eligible-popularity 0.3836, eligible-random 0.1598 |
-| Retrieval `Recall@10` | 0.0868 | eligible-popularity 0.0548 |
-| Click AUC (calibrated) / ECE | 0.5353 / 0.0019 | oracle ceiling 0.6316 |
-| Apply-given-click AUC / ECE | 0.5754 / 0.0117 | oracle ceiling 0.6143 |
-| Approve-given-apply AUC / ECE | 0.7843 / 0.0280 | oracle ceiling 0.9251 |
-| Pareto at `α = 0.5`: revenue / user benefit / harm per slate ($) | 35.97 / 437.31 / 0.000 | `α = 1`: 47.41 / 308.46 / 0.160 |
-| Pending-policy bias on the mortgage slice (`drop` / `ipw` / `negative`) | 0.0659 / 0.1721 / -0.5909 | truth 0.6255 |
-| Serving latency p50, CPU, `B = 1` | 19.84 ms | target 10 ms; retrieval alone 16.5931 ms |
-| Eligibility violations in served slates | 0 | asserted by the pipeline |
-
-The latency target is missed by the TIGER beam (the decoder re-runs the history at each of
-four levels for 100 beams); the write-up analyzes the gap and the KV-cache mitigation rather
-than hiding it.
 
 ## Layout
 

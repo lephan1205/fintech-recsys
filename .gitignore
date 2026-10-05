@@ -11,3 +11,4 @@ dist/
 data/generated/
 artifacts/
 .DS_Store
+.claude/
