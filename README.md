@@ -24,17 +24,6 @@ re-ranking time.
 
 For a detailed discussion of the design, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. Full measured results are in [docs/RESULTS.md](docs/RESULTS.md) and every tuned value with its rationale in [docs/DECISION_REGISTER.md](docs/DECISION_REGISTER.md).
 
-## Design highlights
-
-This project shows how to design an end-to-end recommender for a regulated marketplace. The main deliverable is the design reasoning: [ARCHITECTURE.md](docs/ARCHITECTURE.md) explains where each component sits and why, and the [decision register](docs/DECISION_REGISTER.md) records every tuned value with its rationale.
-
-- **Compliance by construction, not by filtering.** Eligibility is a hard constraint at three points: a prefix-trie logit mask means the retriever can't *generate* an ineligible product, a post-retrieval gate re-checks the candidates, and an assertion checks the final slate ([§4.2](docs/ARCHITECTURE.md#42-the-prefix-trie-as-a-compliance-mechanism)).
-- **A cascade sized to the serving budget.** Generative retrieval narrows the catalog to 100 candidates; HSTU then scores all 100 in one batched pass, with an attention mask that keeps candidates independent ([§5.2](docs/ARCHITECTURE.md#52-m-falcon-scoring-all-candidates-in-one-pass)).
-- **The conversion funnel modeled as one multi-task problem.** PLE towers predict click → apply → approve (plus a ZILN loan-amount head) under one funnel loss. The loss trains on every impression, not just clicked ones, to avoid sample-selection bias, and treats delayed or pending approvals as a labeling policy ([§6.3](docs/ARCHITECTURE.md#63-the-unified-funnel-loss)).
-- **Calibrate first, then value.** Probabilities are calibrated per tower before they're converted into expected revenue and net member benefit ([§7.1](docs/ARCHITECTURE.md#71-calibration-before-valuation-never-after-prm), [§7.2](docs/ARCHITECTURE.md#72-valuation-what-an-offer-is-worth-in-dollars)).
-- **Business policy lives at serving time, not in the loss.** The revenue vs. member-benefit weight `α`, suitability guardrails and product-family diversity are all applied after training, so changing policy never requires a retrain. A transformer re-ranker (PRM) only reorders the final slate.
-- **Failure modes stated up front.** The [appendix](docs/ARCHITECTURE.md#appendix--failure-modes-and-what-catches-them) maps each failure mode to the mechanism or test that catches it, and the 127 tests check the invariants (eligibility, causality, calibration, loss stability).
-
 ![Serving pipeline](docs/diagrams/serving_pipeline.svg)
 
 ![Training pipeline](docs/diagrams/training_pipeline.svg)
